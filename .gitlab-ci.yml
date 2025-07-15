@@ -1,0 +1,100 @@
+variables:
+  REMOTE_SERVER_DEPLOY_FOLDER: "/home/docker-cicd/cicd-deploy/${CI_PROJECT_NAME}"
+
+default:
+  image: docker:27.2.1
+  before_script:
+    # Use to start the SSH agent and set up the necessary environment variables in the current shell session.
+    - eval $(ssh-agent -s)
+    # Takes the processed private key and pipes it into ssh-add, which adds the key to the SSH agent.
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    # Add the ip address of a remote server to the known_hosts file on the gitlab runner build folder. 
+    - ssh-keyscan $REMOTE_IPADDRESS >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    # The scp command itself doesn't have a direct equivalent for the --exclude and --include options like rsync does. 
+    # scp is simpler and doesn't offer the same advanced filtering capabilities.
+    - apk add rsync
+
+stages:
+  - test
+  - deploy
+  - shutdown
+  - destroy
+  - cleanup
+
+# Delete deploy project repo on remote server.
+.cleanup_job: &cleanup_job
+    # USER docker-cicd id: 10001, GROUP docker-cicd id: 10001
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker run --rm -v ${REMOTE_SERVER_DEPLOY_FOLDER}:/workdir busybox /bin/sh -c 'chown -R 10001:10001 /workdir'"
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "rm -rf ${REMOTE_SERVER_DEPLOY_FOLDER}"
+
+# Using SSH and rsync to copy project files to a remote server
+.deployment_job: &deployment_job
+    # Configure the thanos bucket config. 
+    - sed -i "s/<MINIO_ACCESS_KEY_ID>/${MINIO_ACCESS_KEY_ID}/g" ${CI_PROJECT_DIR}/data/thanos/bucket_config.yaml
+    - sed -i "s/<MINIO_SECRET_ACCESS_KEY>/${MINIO_SECRET_ACCESS_KEY}/g" ${CI_PROJECT_DIR}/data/thanos/bucket_config.yaml
+    # Creates a directory on the remote server for the project.
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS mkdir -p cicd-deploy/${CI_PROJECT_NAME}
+    # Uses rsync to copy project files to the remote server, excluding the .git directory.
+    - rsync -av --exclude='.git' --include='.*' --include='*' -e ssh "${CI_PROJECT_DIR}/" "$SSH_DOCKER_USER@$REMOTE_IPADDRESS:cicd-deploy/${CI_PROJECT_NAME}/"
+
+test_ssh_connection:
+  stage: test
+  script:
+    # Checks the SSH connection to the remote server by attempting to execute pwd and ls -la commands.
+    - ssh -o BatchMode=yes -o ConnectTimeout=5 $SSH_DOCKER_USER@$REMOTE_IPADDRESS 'pwd; ls -la'
+  tags:
+    - docker-socket
+
+ssh_scp_docker-compose-up:
+  stage: deploy
+  script:
+    - *deployment_job 
+    # Use SSH to remotely execute a Docker Compose to start the services command on a server. 
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker-compose -p monitoring -f ${REMOTE_SERVER_DEPLOY_FOLDER}/docker-compose.yml up -d"
+    # Copy data to the container.
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker cp ${REMOTE_SERVER_DEPLOY_FOLDER}/data/prometheus/prometheus.yml prometheus:/opt/bitnami/prometheus/conf"
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker cp ${REMOTE_SERVER_DEPLOY_FOLDER}/data/prometheus/alert.rules prometheus:/opt/bitnami/prometheus/con"
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker cp ${REMOTE_SERVER_DEPLOY_FOLDER}/data/alertmanager/config.yml alertmanager:/etc/alertmanager"
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker cp ${REMOTE_SERVER_DEPLOY_FOLDER}/data/thanos/alert_down_services.rules.yaml thanos-sidecar:/etc/thanos"
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker cp ${REMOTE_SERVER_DEPLOY_FOLDER}/data/thanos/bucket_config.yaml thanos-sidecar:/etc/thanos"
+    # Docker Compose file to use and restarts the specific service within that Compose environment.
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker-compose -p monitoring -f ${REMOTE_SERVER_DEPLOY_FOLDER}/docker-compose.yml restart"
+    - *cleanup_job
+  needs: ["test_ssh_connection"]
+  when: manual
+  tags:
+    - docker-socket
+
+cleanup_deployment_failure:
+  stage: cleanup
+  script:
+    - *cleanup_job
+  needs: ["ssh_scp_docker-compose-up"]
+  when: on_failure
+
+ssh_scp_docker-compose-down:
+  stage: shutdown
+  script:
+    - *deployment_job
+    # Docker Compose to stop and remove containers, networks, and volumes defined in the Compose file.
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker-compose -p monitoring -f ${REMOTE_SERVER_DEPLOY_FOLDER}/docker-compose.yml down"
+    - *cleanup_job
+  needs: ["ssh_scp_docker-compose-up"]
+  when: manual
+  tags:
+    - docker-socket
+
+ssh_scp_docker-compose-remove:
+  stage: destroy
+  script:
+    - *deployment_job
+    # Remove named volumes declared in your docker-compose.yml
+    - ssh $SSH_DOCKER_USER@$REMOTE_IPADDRESS "docker-compose -p monitoring -f ${REMOTE_SERVER_DEPLOY_FOLDER}/docker-compose.yml down --volumes"
+    - *cleanup_job
+  needs: ["ssh_scp_docker-compose-up"]
+  when: manual
+  tags:
+    - docker-socket

@@ -1,0 +1,368 @@
+version: '3.9'
+
+# Set a custom name for this volume.
+volumes:
+  prometheus_config:
+    name: prometheus_config
+  prometheus_data:
+    name: prometheus_data
+  alertmanager_config:
+    name: alertmanager_config
+  alertmanager_data:
+    name: alertmanager_data
+  thanos_config:
+    name: thanos_config
+
+networks:
+  traefik:
+    external: true
+
+services:
+  prometheus:
+    image: &prometheusImage bitnami/prometheus:3.4.2
+    container_name: prometheus
+    restart: always
+    user: "1001:1001"  # bitnami images use UID 1001 for non-root
+    command:
+      # To specify which configuration file to load
+      - '--config.file=/opt/bitnami/prometheus/conf/prometheus.yml'
+      # # Where Prometheus writes its database. Defaults to data/.
+      # - '--storage.tsdb.path=/opt/bitnami/prometheus/data'
+      # Maximum duration compacted blocks may span.
+      - '--storage.tsdb.max-block-duration=2h'
+      # Minimum duration of a data block before being persisted.
+      - '--storage.tsdb.min-block-duration=2h'
+      # When to remove old data. Defaults to 15d.
+      - '--storage.tsdb.retention.time=1d'
+      # The maximum number of bytes of storage blocks to retain. 
+      # The oldest data will be removed first. Defaults to 0 or disabled.
+      # Units supported: B, KB, MB, GB, TB, PB, EB. Ex: "512MB".
+      - '--storage.tsdb.retention.size=1GB'
+      # Enable shutdown and reload via HTTP request.
+      - '--web.enable-lifecycle'
+      # Path to the console library directory.
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      # Path to the console template directory, available at /consoles.
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - 9081:9090
+    networks:
+      - traefik
+    volumes:
+      - prometheus_config:/opt/bitnami/prometheus/conf 
+      - prometheus_data:/opt/bitnami/prometheus/data 
+    links:
+      - alertmanager:alertmanager
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.prometheus  
+
+  thanos-sidecar:
+    image: &thanosImage bitnami/thanos:0.39.1
+    # image: &thanosImage bitnami/thanos:0.37.2
+    container_name: thanos-sidecar
+    restart: always
+    networks:
+      - traefik
+    user: "1001:1001"
+    command:
+      - 'sidecar'
+      # Data directory of TSDB.
+      - '--tsdb.path=/opt/bitnami/prometheus/data'
+      # URL at which to reach Prometheus's API. For better performance use local network.
+      - '--prometheus.url=http://prometheus:9090'
+      # Listen host:port for HTTP endpoints.
+      - '--http-address=0.0.0.0:10902'
+      # Listen ip:port address for gRPC endpoints (StoreAPI).
+      - '--grpc-address=0.0.0.0:10091'
+      # Path to YAML file that contains object store configuration.
+      - '--objstore.config-file=/etc/thanos/bucket_config.yaml'
+    volumes:
+      - thanos_config:/etc/thanos
+      - prometheus_data:/opt/bitnami/prometheus/data
+    depends_on:
+      - prometheus
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.thanos-sidecar 
+
+  thanos-query-frontend:
+    image: *thanosImage
+    container_name: thanos-query-frontend
+    restart: always
+    command:
+      - 'query-frontend'
+      # Listen host:port for HTTP endpoints.
+      - '--http-address=0.0.0.0:10901'
+      # URL of downstream Prometheus Query compatible API.
+      - '--query-frontend.downstream-url=http://thanos-querier:10902'
+    ports:
+      - 10901:10901
+    networks:
+      - traefik
+    depends_on:
+      - thanos-querier
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.thanos-query-frontend
+    # Labels: Sets Traefik configuration for routing. Un-comment if you need to expose the Thanos Query Frontend to external or internal networks.
+    labels:
+      # Dynamic configuration with Docker Labels
+      # Ref: https://docs.traefik.io/reference/dynamic-configuration/docker/
+      # Explicitly tell Traefik to expose this container
+      - traefik.enable=true   
+      # The domain the service will respond to
+      - traefik.http.routers.thanos-query-frontend-router.rule=Host(`thanos-query.domain.com`)
+      # Allow request only from the predefined entry point named "web" http port
+      - traefik.http.routers.thanos-query-frontend-router.entrypoints=web
+      # Set the service parameter on the router.
+      - traefik.http.routers.thanos-query-frontend-router.service=thanos-query-frontend-service
+      # Forwarding requests to more than one port on a container requires referencing the 
+      # service loadbalancer port definition using the service parameter on the router.
+      - traefik.http.services.thanos-query-frontend-service.loadbalancer.server.port=10901
+
+  thanos-querier:
+    image: *thanosImage
+    container_name: thanos-querier
+    restart: always
+    command:
+      - 'query'
+      # Listen ip:port address for gRPC endpoints(StoreAPI). 
+      # Make sure this address is routable from other components.
+      - '--grpc-address=0.0.0.0:10091'
+      # Listen host:port for HTTP endpoints.
+      - '--http-address=0.0.0.0:10902'
+      # Labels to treat as a replica indicator along which data is deduplicated. 
+      # Still you will be able to query without deduplication using 'dedup=false' parameter. 
+      # Data includes time series, recording rules, and alerting rules.
+      - '--query.replica-label=replica'
+      # Addresses of statically configured store API servers (repeatable). 
+      - '--endpoint=thanos-sidecar:10091'
+      - '--endpoint=thanos-store-gateway:10091'
+      - '--endpoint=thanos-ruler:10091'
+    ports:
+      - 10902:10902
+    networks:
+      - traefik
+    depends_on:
+      - thanos-sidecar
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.thanos-querier
+
+  thanos-store-gateway:
+    image: *thanosImage
+    container_name: thanos-store-gateway
+    restart: always
+    volumes:
+      - thanos_config:/etc/thanos
+    networks:
+      - traefik
+    user: "0:0" # issue otherwise cant mkdir /tmp folder
+    command:
+      - 'store'
+      # Listen ip:port address for gRPC endpoints(StoreAPI). 
+      # Make sure this address is routable from other components.
+      - '--grpc-address=0.0.0.0:10091'
+      # Listen host:port for HTTP endpoints.
+      - '--http-address=0.0.0.0:10902'
+      # Local data directory used for caching purposes (index-header, 
+      # in-mem cache items and meta.jsons). 
+      # If removed, no data will be lost, just store will have to rebuild the cache.
+      - '--data-dir=/tmp/thanos/store'
+      # Path to YAML file that contains object
+      # store configuration. See format details:
+      # https://thanos.io/tip/thanos/storage.md/#configuration
+      - '--objstore.config-file=/etc/thanos/bucket_config.yaml'
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.thanos-querier
+
+  thanos-compactor:
+    image: *thanosImage
+    container_name: thanos-compactor
+    restart: always
+    networks:
+      - traefik
+    user: "0:0" # issue otherwise cant mkdir /data folder
+    command:
+      - 'compact'
+      # Log filtering level.
+      - '--log.level=debug'
+      # Data directory in which to cache blocks and process compactions.
+      - '--data-dir=/data'
+      # Path to YAML file that contains object
+      # store configuration. See format details:
+      # https://thanos.io/tip/thanos/storage.md/#configuration
+      - '--objstore.config-file=/etc/thanos/bucket_config.yaml'
+      # Do not exit after all compactions have been processed and wait for new work.
+      - '--wait'
+      # How long to retain raw samples in bucket. 0d - disables this retention
+      - '--retention.resolution-raw=7d'
+      # How long to retain samples of resolution 1 (5 minutes) in bucket. 0d - disables this retention
+      - '--retention.resolution-5m=30d'
+      # How long to retain samples of resolution 2 (1 hour) in bucket. 0d - disables this retention
+      - '--retention.resolution-1h=60d'
+    volumes:
+      - thanos_config:/etc/thanos
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.thanos-querier
+
+  # https://github.com/prometheus/node_exporter
+  # To do: Securing node_exporter if require to expose to the internet.
+  node-exporter:
+    image: prom/node-exporter:v1.9.0
+    container_name: node-exporter
+    restart: always
+    # Read-only - the worst case scenario is someone exploits a flaw in node-exporter and reads info on your disk. 
+    # And you shouldn't be exposing cadvisor to the internet.
+    read_only: true
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - --collector.filesystem.ignored-mount-points
+      - "^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)"
+    ports:
+      - 9100:9100
+    networks:
+      - traefik
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.node-exporter
+        
+  # https://github.com/google/cadvisor/blob/master/docs/running.md
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor-amd64:v0.51.0
+    container_name: cadvisor
+    restart: always
+    expose:
+      - 8080
+    networks:
+      - traefik
+    privileged: true
+    command:
+      - '--docker_only=true'
+      - '--housekeeping_interval=30s'
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.cadvisor
+
+  thanos-ruler:
+    image: *thanosImage
+    container_name: thanos-ruler
+    restart: always
+    user: "0:0" # issue otherwise cant mkdir /data folder
+    command:
+      - 'rule'
+      # Listen ip:port address for gRPC endpoints(StoreAPI). 
+      # Make sure this address is routable from other components.
+      - '--grpc-address=0.0.0.0:10091'
+      # Listen host:port for HTTP endpoints.
+      - '--http-address=0.0.0.0:10902'
+      # Log filtering level.
+      - '--log.level=debug'
+      # data directory
+      - '--data-dir=/data'
+      # The default evaluation interval to use.
+      - '--eval-interval=15s'
+      # Rule files that should be used by rule manager. Can be in glob format (repeated).
+      # Note that rules are not automatically detected,
+      # use SIGHUP or do HTTP POST /-/reload to re-read them.
+      - '--rule-file=/etc/thanos/*.rules.yml'
+      # Alertmanager replica URLs to push firing alerts.
+      - '--alertmanagers.url=http://alertmanager:9093'
+      # Addresses of statically configured query API servers (repeatable). 
+      # The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect
+      # query API servers through respective DNS lookups.
+      - '--query=thanos-querier:10902'
+      # Path to YAML file that contains object
+      # store configuration. See format details:
+      # https://thanos.io/tip/thanos/storage.md/#configuration
+      - '--objstore.config-file=/etc/thanos/bucket_config.yaml'
+      # --label
+      # Labels to be applied to all generated metrics (repeated). 
+      # Similar to external labels for Prometheus, 
+      # used to identify ruler and its blocks as unique source.
+      - "--label=ruler_cluster=\"server-1\""
+      - "--label=ruler_replica=\"r1\""
+    ports:
+      - 10903:10902
+    networks:
+      - traefik
+    volumes:
+      - thanos_config:/etc/thanos
+    depends_on:
+      - thanos-querier
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.thanos-ruler
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertmanager
+    restart: always
+    ports:
+      - 9093:9093
+    networks:
+      - traefik
+    command:
+      # To specify which configuration file to load.
+      - '--config.file=/etc/alertmanager/config.yml'
+      # Base path for data storage.
+      - '--storage.path=/alertmanager'
+    volumes:
+      - alertmanager_config:/etc/alertmanager/
+      - alertmanager_data:/alertmanager/
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224 
+        fluentd-async: 'true'
+        # Tag for Fluent Bit to Loki
+        tag: loki.alertmanager
